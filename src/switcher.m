@@ -1,8 +1,8 @@
 // switcher.m — the switcher state machine (ported from switcher.go).
 //
 // Owns the window list for the current activation, the selected index, and
-// the open/closed flag. The event tap (Cmd+Tab / Cmd+` / Esc / flags-changed)
-// and the panel's mouse handlers call the gfOn* / gfSetSelection functions
+// the open/closed flag. The hotkey handler (Cmd+Tab / Cmd+` / Esc / modifier
+// release) and the panel's mouse handlers call the gfOn* / gfSetSelection functions
 // declared in switcher.h; those drive the panel through the gf_* functions
 // implemented in cocoa.m.
 //

@@ -69,10 +69,10 @@ using `open`:
 The `FWORKS` variable in the `Makefile` lists these system frameworks:
 
 - `Cocoa` — NSApplication, NSPanel, NSImage
-- `Carbon` — `RegisterEventHotKey` (the Secure Event Input fallback
-  hotkeys) and `IsSecureEventInputEnabled`
+- `Carbon` — `RegisterEventHotKey` (the switch shortcuts) and
+  `IsSecureEventInputEnabled`
 - `ApplicationServices` — Accessibility (AX) API
-- `CoreGraphics` — `CGEventTap`, window listing, screen capture
+- `CoreGraphics` — modifier state, window listing, screen capture
 - `CoreServices` — `LSSharedFileList` (the **Start at boot** Login Items entry)
 
 `CGWindowListCreateImage` was obsoleted in the macOS 15 SDK headers, so the
@@ -83,9 +83,9 @@ thumbnails will fall back to app icons and the program will keep working.
 The long-term migration is to ScreenCaptureKit.
 
 `CGSSetSymbolicHotKeyEnabled`, the private call that switches the system
-Cmd+Tab off while go_fish runs, is resolved the same way. If it ever goes
-missing, the system Cmd+Tab stays on and wins over go_fish's hotkeys under
-Secure Event Input; nothing else changes.
+Cmd+Tab and Cmd+\` off while go_fish runs, is resolved the same way. If it
+ever goes missing, the system shortcuts stay on and win over go_fish's
+hotkeys, and they would have to be turned off in System Settings.
 
 `CFLAGS` passes `-Wno-deprecated-declarations` because both the `dlsym`'d
 capture path and the `LSSharedFileList` login-item calls are formally
@@ -234,7 +234,7 @@ go_fish/
     │                      #   gfOnCancel / gfSetSelection / gfOnClose /
     │                      #   gfOnFocus / gfToggleSort
     ├── cocoa.h            # C interface exposed by cocoa.m (gf_* functions)
-    ├── cocoa.m            # Cocoa: event tap, parallelized AX enumeration,
+    ├── cocoa.m            # Cocoa: hotkeys, parallelized AX enumeration,
     │                      #   panel UI, status item + menu (Show Window Grid /
     │                      #   Minimize All / Cascade All / About… /
     │                      #   Settings… / Quit), About window,
@@ -243,7 +243,6 @@ go_fish/
     │                      #   title overrides), MRU,
     │                      #   thumbnail cache, activation, close, bulk minimize /
     │                      #   cascade, Login Items install/uninstall,
-    │                      #   Carbon hotkey fallback for Secure Event Input,
     │                      #   Secure Event Input poller + red-X icon overlay
     ├── hook.png           # menu-bar icon, embedded via xxd-generated hook_png.h
     └── maui.png           # About-window image, embedded via maui_png.h
@@ -268,9 +267,8 @@ The seam between the switcher state machine (`switcher.m`) and the Cocoa layer
   on the main queue, handing over ownership of the list. Must be *called* on
   the main thread: the snapshot opens by seeding and reading the MRU list,
   which is main-thread state. Keeping the fan-out off the main thread matters
-  because the event tap's run-loop source lives there — blocking it delays the
-  modifier-up that signals a quick switch, and a stalled app can hold it long
-  enough for macOS to disable the tap (`kCGEventTapDisabledByTimeout`).
+  because the hotkey handler and the modifier-release poll run there — blocking
+  it delays the release that signals a quick switch.
 - `gf_enumerateWindows(out_count, filterPID)` — the blocking form, same
   main-thread requirement. Used only where blocking is already the shape of the
   operation: the bulk-arrangement actions, which then spend far longer moving

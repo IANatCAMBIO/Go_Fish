@@ -42,10 +42,9 @@ void gf_run(const void *iconBytes, int iconLen);
 //
 // gf_enumerateWindowsAsync runs that fan-out off the main thread and invokes
 // `done` back on the main queue, handing over ownership of the list. Use it on
-// the hotkey path: the event tap's run-loop source lives on the main thread, so
-// blocking it there delays the modifier-up that signals a quick switch, and a
-// stalled app can hold it long enough for macOS to disable the tap outright
-// (kCGEventTapDisabledByTimeout). `list` is NULL and `count` 0 if nothing matched.
+// the hotkey path: the hotkey handler and the modifier-release poll both run
+// on the main thread, so blocking it delays the release that signals a quick
+// switch. `list` is NULL and `count` 0 if nothing matched.
 typedef void (^gf_enum_done_t)(gf_window_t *list, int count);
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID);
 void         gf_enumerateWindowsAsync(int filterPID, gf_enum_done_t done);

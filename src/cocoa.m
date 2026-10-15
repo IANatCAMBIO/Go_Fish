@@ -2,10 +2,9 @@
 //
 // Responsibilities:
 //   - NSApplication lifecycle (gf_run).
-//   - Global CGEventTap intercepting Cmd+Tab / Cmd+` / flag changes / Escape.
-//   - Carbon hotkeys for the same shortcuts, which still fire under Secure
-//     Event Input when the tap sees nothing; the system Cmd+Tab is switched
-//     off while go_fish runs so these win over the Dock's switcher.
+//   - Carbon hotkeys for Cmd+Tab / Cmd+` / Escape, which keep working under
+//     Secure Event Input, plus a poll for the modifier release. The system
+//     Cmd+Tab and Cmd+` are switched off while go_fish runs so these win.
 //   - Window enumeration via the Accessibility API (covers minimized windows),
 //     parallelized across apps via dispatch_apply so total latency scales with
 //     max(per-app), not the sum across every running app.
@@ -25,9 +24,9 @@
 //     > General > Login Items) via the LSSharedFileList session list.
 //     Effective on next login; we don't relaunch the current instance.
 //   - Secure Event Input poller (0.5 s NSTimer) backing the SEI menu toggle.
-//     When another app holds Secure Event Input, every third-party CGEventTap
-//     is bypassed by macOS — so we paint a red-X overlay on the menu-bar icon
-//     and update the tooltip to say go_fish is running on its Carbon hotkeys.
+//     When another app holds Secure Event Input we paint a red-X overlay on
+//     the menu-bar icon and say so in the tooltip. go_fish's hotkeys keep
+//     working; the indicator is there to show which app is hiding keystrokes.
 
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -73,8 +72,8 @@ static void gf_loadSymbols(void) {
 // Private API. Maps an AX window element to its CGWindowID. Stable for ~15 years.
 extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *out);
 
-// Switcher event entry points (defined in switcher.m). The event tap and the
-// panel mouse handlers call these to drive selection / commit / cancel / close.
+// Switcher event entry points (defined in switcher.m). The hotkey handler and
+// the panel mouse handlers call these to drive selection / commit / cancel / close.
 #include "switcher.h"
 
 // =========================================================================
@@ -95,10 +94,8 @@ static atomic_int        gActive = 0;          // 1 when panel is up.
 // Bumped by gf_showPanel and gf_hidePanel; a deferred show bails unless its
 // token is still the current one.
 static atomic_ullong     gShowToken = 0;
-static CFMachPortRef     gEventTap = NULL;
-static CFRunLoopSourceRef gEventTapSrc = NULL;
 
-// 0 = Cmd+Tab (default), 1 = Ctrl+Tab, 2 = Option+Tab
+// 0 = Cmd+Tab (default), 1 = Ctrl+Tab. See gf_hotkey_modifiers.
 static atomic_int gHotkeyModifier = 0;
 
 // Quick-switch delay in milliseconds: 75, 100 (default), or 150.
@@ -108,16 +105,14 @@ static atomic_int gQuickSwitchDelayMs = 100;
 static atomic_int gShowFocusButton = 1;
 
 // Set to 1 when the hotkey modifier is released before the panel has opened
-// (i.e. gActive is still 0 at FlagsChanged time). gf_showPanel skips the grid
-// and lets the already-queued gfOnCommit activate the window silently.
+// (i.e. gActive is still 0 when the release poll sees it). gf_showPanel skips
+// the grid and lets gfOnCommit activate the window silently.
 static atomic_int gQuickSwitch = 0;
 
 // Uptime, in nanoseconds, of the most recent hotkey press. A modifier release
 // only counts as a quick switch if it lands inside the quick-switch delay
-// window opened by that press. Without this bound, gQuickSwitch latched on any
-// modifier release at all — a Shift tap while typing was enough — and stayed
-// latched until the next hotkey press, so the very next "Show Window Grid"
-// from the menu was silently swallowed by the skip branch in gf_showPanel.
+// window opened by that press, and gf_showDelayMs charges the time since the
+// press against that delay.
 static atomic_ullong gHotkeyPressNs = 0;
 
 // Monotonic nanoseconds; unaffected by wall-clock changes, and does not
@@ -268,200 +263,54 @@ void gf_promptScreenRecording(void) {
 }
 
 // =========================================================================
-// Event tap — Cmd+Tab interception
+// Hotkeys — Cmd+Tab / Cmd+` via RegisterEventHotKey
 // =========================================================================
+//
+// The switch shortcuts are Carbon hotkeys. The WindowServer matches them
+// itself, so unlike a CGEventTap they keep firing while another app holds
+// Secure Event Input (Terminal at a sudo prompt, password fields).
+//
+// A hotkey only reports its key press, so the rest of the gesture is covered
+// separately:
+//   - the modifier release is polled from the HID modifier state while a
+//     hotkey-started activation is open (gf_on_switch_hotkey);
+//   - Escape and modifier+Escape are registered while the grid is on screen
+//     (gf_set_escape_hotkeys, from gf_showPanel / gf_hidePanel).
+//
+// The system's own shortcuts on these keys win over registered hotkeys:
+// Cmd+Tab and Cmd+Shift+Tab (the Dock's switcher) and Cmd+` (move focus to
+// the next window). With the Cmd modifier go_fish switches them off while it
+// runs and puts back the user's saved setting when it exits.
+
+#define GF_COUNT(array) (sizeof(array) / sizeof((array)[0]))
 
 // The hotkey modifier in both forms go_fish needs it: an event-flag mask for
-// the event tap and the release poller, and a Carbon modifier for
-// RegisterEventHotKey. Indexed by gHotkeyModifier.
+// the release poll and a Carbon modifier for RegisterEventHotKey. Indexed by
+// gHotkeyModifier. Option is not offered: macOS 15 and later refuse hotkeys
+// whose only modifier is Option.
 typedef struct {
     CGEventFlags flag;
     UInt32       carbon;
 } gf_modifier_t;
 
 static const gf_modifier_t gf_hotkey_modifiers[] = {
-    { kCGEventFlagMaskCommand,   cmdKey     },  // 0 = Cmd+Tab
-    { kCGEventFlagMaskControl,   controlKey },  // 1 = Ctrl+Tab
-    { kCGEventFlagMaskAlternate, optionKey  },  // 2 = Option+Tab
+    { kCGEventFlagMaskCommand, cmdKey     },  // 0 = Cmd+Tab (default)
+    { kCGEventFlagMaskControl, controlKey },  // 1 = Ctrl+Tab
 };
-
-/*
- * gf_hotkey_modifier — the configured hotkey modifier.
- *
- * Inputs:
- *   none (reads gHotkeyModifier)
- *
- * Output:
- *   the matching gf_hotkey_modifiers entry. An out-of-range stored value
- *   means Cmd, the default.
- */
-static const gf_modifier_t *
-gf_hotkey_modifier(void)
-{
-    int choice = atomic_load(&gHotkeyModifier);
-    if (choice < 1 || choice > 2) {
-        return &gf_hotkey_modifiers[0];
-    }
-    return &gf_hotkey_modifiers[choice];
-}
-
-/*
- * gf_hotkey_pressed — start or advance an activation from a hotkey press.
- * Shared by the event tap and the Carbon hotkey handler.
- *
- * Opens a fresh quick-switch window, then hands the press to the switcher on
- * the main queue. The tap calls this from its callback, which must return in
- * well under a millisecond: gfOnHotkey starts AX window enumeration, and
- * running it inline causes kCGEventTapDisabledByTimeout at the HID level, so
- * the press slips through to the system switcher. The flags are reset here
- * rather than in the dispatched block because a modifier release arriving
- * before that block runs is exactly the quick switch we need to catch.
- *
- * Inputs:
- *   shift — nonzero reverses the cycle direction
- *   scope — 0 = all apps (Tab), 1 = frontmost app only (`)
- *
- * Output:
- *   none
- */
-static void
-gf_hotkey_pressed(int shift, int scope)
-{
-    atomic_store(&gQuickSwitch, 0);
-    atomic_store(&gHotkeyPressNs, gf_nowNs());
-    dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(shift, scope); });
-}
-
-/*
- * gf_modifier_released — commit the activation when the hotkey modifier is
- * released. Shared by the event tap and the Carbon release poller.
- *
- * If the release lands before the panel has opened (gActive still 0), it
- * marks a quick switch: gf_showPanel skips the grid and the gfOnCommit
- * dispatched here activates the window silently. Only a release inside the
- * pending press's delay window counts. The tap reaches this on every release
- * of the modifier (releasing Shift after a capital letter, say), and latching
- * on those left the flag set indefinitely.
- *
- * Inputs:
- *   none
- *
- * Output:
- *   none
- */
-static void
-gf_modifier_released(void)
-{
-    uint64_t pressed = atomic_load(&gHotkeyPressNs);
-    uint64_t window  = (uint64_t)atomic_load(&gQuickSwitchDelayMs) * NSEC_PER_MSEC;
-    if (!atomic_load(&gActive) && pressed && gf_nowNs() - pressed <= window) {
-        atomic_store(&gQuickSwitch, 1);
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{ gfOnCommit(); });
-}
-
-static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
-                              CGEventRef event, void *refcon) {
-    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-        fprintf(stderr,
-            "go_fish: event tap disabled by macOS (type=%u). "
-            "Shortcuts won't fire until Accessibility permission is re-granted.\n"
-            "  Fix: System Settings > Privacy & Security > Accessibility\n"
-            "       Remove go_fish, re-add it, then quit and reopen go_fish.\n",
-            type);
-        if (gEventTap) CGEventTapEnable(gEventTap, true);
-        return event;
-    }
-
-    CGEventFlags flags = CGEventGetFlags(event);
-    BOOL modDown = (flags & gf_hotkey_modifier()->flag) != 0;
-    int  shift   = (flags & kCGEventFlagMaskShift) != 0;
-
-    if (type == kCGEventKeyDown) {
-        CGKeyCode key = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-        if (modDown && key == kVK_Tab) {
-            gf_hotkey_pressed(shift, 0);
-            return NULL;
-        }
-        if (modDown && key == kVK_ANSI_Grave) {
-            gf_hotkey_pressed(shift, 1);
-            return NULL;
-        }
-        if (key == kVK_Escape && atomic_load(&gActive)) {
-            dispatch_async(dispatch_get_main_queue(), ^{ gfOnCancel(); });
-            return NULL;
-        }
-    } else if (type == kCGEventFlagsChanged) {
-        if (!modDown) {
-            gf_modifier_released();
-        }
-    }
-    return event;
-}
-
-static void installEventTap(void) {
-    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventFlagsChanged);
-    // Prefer HID-level tap: it fires before the macOS system Cmd+Tab handler,
-    // so we can intercept Cmd+Tab regardless of whether the system shortcut is
-    // enabled in System Settings. Requires the same Accessibility permission
-    // as the session-level tap; falls back to session-level if unavailable.
-    gEventTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap,
-                                 kCGEventTapOptionDefault, mask, tapCallback, NULL);
-    if (!gEventTap) {
-        fprintf(stderr,
-            "go_fish: HID event tap unavailable, falling back to session-level tap.\n"
-            "  Cmd+Tab may be intercepted by the macOS switcher; if so, pick an\n"
-            "  alternative hotkey via the go_fish menu bar icon → Switch hotkey.\n");
-        gEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
-                                     kCGEventTapOptionDefault, mask, tapCallback, NULL);
-    }
-    if (!gEventTap) {
-        fprintf(stderr,
-            "go_fish: FAILED to create event tap — keyboard shortcuts will not work.\n"
-            "  Fix: System Settings > Privacy & Security > Accessibility\n"
-            "       Remove go_fish from the list, re-add it, then relaunch.\n");
-        return;
-    }
-    fprintf(stderr, "go_fish: event tap installed OK.\n");
-    gEventTapSrc = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gEventTap, 0);
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), gEventTapSrc, kCFRunLoopCommonModes);
-    CGEventTapEnable(gEventTap, true);
-}
-
-// =========================================================================
-// Carbon hotkeys — Cmd+Tab under Secure Event Input
-// =========================================================================
-//
-// While an app holds Secure Event Input, macOS hides every keystroke from the
-// event tap and Cmd+Tab falls through to the Dock's switcher. Hotkeys
-// registered with RegisterEventHotKey are matched by the WindowServer instead
-// of being delivered through taps, so they keep firing. Outside Secure Event
-// Input the hotkeys fire alongside the tap for the same key press, so the
-// handler ignores them then and the tap path stays the only one.
-//
-// A hotkey only reports the key press. The two things the tap also sees are
-// covered separately while a hotkey-started activation is open:
-//   - the modifier release, polled from the HID modifier state;
-//   - Escape, which is pressed with the modifier still held, so it is
-//     registered as one more hotkey for the length of the activation.
-//
-// The system's own Cmd+Tab and Cmd+Shift+Tab (symbolic hotkeys 1 and 2) win
-// over registered hotkeys. With the Cmd modifier they are switched off while
-// go_fish runs and switched back on when it exits.
 
 // Signature shared by every go_fish hotkey ('gfsh').
 static const OSType gf_hotkey_signature = 'gfsh';
 
 enum gf_hotkey_id {
-    gf_hotkey_next = 1,     // modifier+Tab
-    gf_hotkey_prev,         // modifier+Shift+Tab
-    gf_hotkey_app_next,     // modifier+`
-    gf_hotkey_app_prev,     // modifier+Shift+`
-    gf_hotkey_cancel,       // modifier+Escape, only during an activation
+    gf_hotkey_next = 1,       // modifier+Tab
+    gf_hotkey_prev,           // modifier+Shift+Tab
+    gf_hotkey_app_next,       // modifier+`
+    gf_hotkey_app_prev,       // modifier+Shift+`
+    gf_hotkey_escape,         // Escape, while the grid is up
+    gf_hotkey_modifier_escape // modifier+Escape, while the grid is up
 };
 
-// The always-registered hotkeys and the gf_hotkey_pressed arguments each one
-// stands for.
+// The always-registered hotkeys and the gfOnHotkey arguments each stands for.
 typedef struct {
     UInt32 id;
     UInt32 key_code;
@@ -476,18 +325,48 @@ static const gf_switch_hotkey_t gf_switch_hotkeys[] = {
     { gf_hotkey_app_prev, kVK_ANSI_Grave, 1, 1 },
 };
 
-#define GF_SWITCH_HOTKEY_COUNT \
-    (sizeof(gf_switch_hotkeys) / sizeof(gf_switch_hotkeys[0]))
+// System symbolic hotkeys on the Cmd versions of the switch shortcuts:
+// Cmd+Tab, Cmd+Shift+Tab, and Cmd+` (move focus to next window).
+static const int gf_symbolic_hotkeys[] = { 1, 2, 27 };
 
-// System symbolic hotkey ids for the Dock's Cmd+Tab and Cmd+Shift+Tab.
-static const int gf_symbolic_hotkeys[] = { 1, 2 };
-
-static EventHotKeyRef    gf_switch_refs[GF_SWITCH_HOTKEY_COUNT];
-static EventHotKeyRef    gf_cancel_ref   = NULL;  // non-NULL during an activation
-static dispatch_source_t gf_release_poll = nil;   // non-nil during an activation
+static EventHotKeyRef    gf_switch_refs[GF_COUNT(gf_switch_hotkeys)];
+static EventHotKeyRef    gf_escape_refs[2];      // non-NULL while the grid is up
+static dispatch_source_t gf_release_poll = nil;  // non-nil during an activation
 
 // Release poll interval. Far inside the 75 ms shortest quick-switch delay.
 static const uint64_t gf_release_poll_ns = 10 * NSEC_PER_MSEC;
+
+/*
+ * gf_hotkey_modifier_index — the configured hotkey modifier as an index.
+ *
+ * Inputs:
+ *   none (reads gHotkeyModifier)
+ *
+ * Output:
+ *   an index into gf_hotkey_modifiers. An out-of-range stored value (such as
+ *   the retired Option+Tab setting) means Cmd, the default.
+ */
+static int
+gf_hotkey_modifier_index(void)
+{
+    int choice = atomic_load(&gHotkeyModifier);
+    if (choice < 0 || choice >= (int)GF_COUNT(gf_hotkey_modifiers)) {
+        return 0;
+    }
+    return choice;
+}
+
+/*
+ * gf_hotkey_modifier — the configured hotkey modifier.
+ *
+ * Inputs:  none (reads gHotkeyModifier)
+ * Output:  the gf_hotkey_modifiers entry at gf_hotkey_modifier_index().
+ */
+static const gf_modifier_t *
+gf_hotkey_modifier(void)
+{
+    return &gf_hotkey_modifiers[gf_hotkey_modifier_index()];
+}
 
 /*
  * gf_register_hotkey — register one go_fish hotkey on the application target.
@@ -498,8 +377,7 @@ static const uint64_t gf_release_poll_ns = 10 * NSEC_PER_MSEC;
  *   modifiers — Carbon modifier mask (cmdKey, shiftKey, ...)
  *
  * Output:
- *   the hotkey ref, or NULL if macOS refused it (logged; macOS 15 and later
- *   refuse hotkeys whose only modifiers are Option or Option+Shift).
+ *   the hotkey ref, or NULL if macOS refused it (logged).
  */
 static EventHotKeyRef
 gf_register_hotkey(UInt32 id, UInt32 key_code, UInt32 modifiers)
@@ -509,9 +387,8 @@ gf_register_hotkey(UInt32 id, UInt32 key_code, UInt32 modifiers)
     OSStatus status = RegisterEventHotKey(key_code, modifiers, hotkey_id,
                                           GetApplicationEventTarget(), 0, &ref);
     if (status != noErr) {
-        fprintf(stderr, "go_fish: could not register hotkey %u (error %d); it "
-                "will not work while Secure Event Input is on.\n",
-                (unsigned)id, (int)status);
+        fprintf(stderr, "go_fish: could not register hotkey %u (error %d); "
+                "that shortcut will not work.\n", (unsigned)id, (int)status);
         return NULL;
     }
     return ref;
@@ -536,73 +413,159 @@ gf_unregister_hotkey(EventHotKeyRef *ref)
 }
 
 /*
- * gf_set_system_switcher — switch the Dock's Cmd+Tab / Cmd+Shift+Tab on or off.
+ * gf_set_escape_hotkeys — register or drop the Escape hotkeys that cancel the
+ * grid: plain Escape (grid opened from the menu) and modifier+Escape (grid
+ * opened by the hotkey, modifier still held). Main thread only.
  *
  * Inputs:
- *   enabled — true to hand Cmd+Tab back to the Dock
+ *   on — true while the grid is on screen
+ *
+ * Output:
+ *   none. Repeated calls with the same value are no-ops.
+ */
+static void
+gf_set_escape_hotkeys(bool on)
+{
+    if (!on) {
+        gf_unregister_hotkey(&gf_escape_refs[0]);
+        gf_unregister_hotkey(&gf_escape_refs[1]);
+        return;
+    }
+    if (gf_escape_refs[0]) {
+        return;
+    }
+    gf_escape_refs[0] = gf_register_hotkey(gf_hotkey_escape, kVK_Escape, 0);
+    gf_escape_refs[1] = gf_register_hotkey(gf_hotkey_modifier_escape, kVK_Escape,
+                                           gf_hotkey_modifier()->carbon);
+}
+
+/*
+ * gf_saved_symbolic_enabled — the user's saved setting for a system symbolic
+ * hotkey, from System Settings > Keyboard Shortcuts.
+ *
+ * Read from com.apple.symbolichotkeys rather than from the live WindowServer
+ * state, so a go_fish that crashed with the shortcuts switched off doesn't
+ * mistake that for the user's choice on the next run.
+ *
+ * Inputs:
+ *   hotkey — symbolic hotkey id
+ *
+ * Output:
+ *   the saved "enabled" flag; true when none is saved (the macOS default).
+ */
+static bool
+gf_saved_symbolic_enabled(int hotkey)
+{
+    NSDictionary *all = [[NSUserDefaults standardUserDefaults]
+        persistentDomainForName:@"com.apple.symbolichotkeys"][@"AppleSymbolicHotKeys"];
+    if (![all isKindOfClass:[NSDictionary class]]) {
+        return true;
+    }
+    NSDictionary *entry = all[[@(hotkey) stringValue]];
+    if (![entry isKindOfClass:[NSDictionary class]] || !entry[@"enabled"]) {
+        return true;
+    }
+    return [entry[@"enabled"] boolValue];
+}
+
+/*
+ * gf_take_system_shortcuts — switch the system's Cmd+Tab, Cmd+Shift+Tab and
+ * Cmd+` off so go_fish's hotkeys get them, or put back the user's saved
+ * setting for each.
+ *
+ * Inputs:
+ *   take — true to switch them off, false to restore the saved settings
  *
  * Output:
  *   none. A no-op if the private symbol is missing.
  */
 static void
-gf_set_system_switcher(bool enabled)
+gf_take_system_shortcuts(bool take)
 {
     if (!gCGSSetSymbolicHotKeyEnabled) {
         return;
     }
-    for (size_t i = 0; i < sizeof(gf_symbolic_hotkeys) / sizeof(gf_symbolic_hotkeys[0]); i++) {
-        gCGSSetSymbolicHotKeyEnabled(gf_symbolic_hotkeys[i], enabled);
+    for (size_t i = 0; i < GF_COUNT(gf_symbolic_hotkeys); i++) {
+        int hotkey = gf_symbolic_hotkeys[i];
+        gCGSSetSymbolicHotKeyEnabled(hotkey, take ? false : gf_saved_symbolic_enabled(hotkey));
     }
 }
 
 /*
- * gf_restore_system_switcher — atexit handler: give Cmd+Tab back to the Dock.
+ * gf_restore_system_shortcuts — atexit handler: put back the user's saved
+ * system shortcuts.
  *
  * Inputs:  none
  * Output:  none
  */
 static void
-gf_restore_system_switcher(void)
+gf_restore_system_shortcuts(void)
 {
-    gf_set_system_switcher(true);
+    gf_take_system_shortcuts(false);
 }
 
 /*
- * gf_end_hotkey_activation — stop watching a hotkey-started activation:
- * cancel the release poll and drop the Escape hotkey.
+ * gf_stop_release_poll — stop watching for the modifier release.
  *
  * Inputs:  none
- * Output:  none. Safe to call when no activation is being watched.
+ * Output:  none. Safe to call when no poll is running.
  */
 static void
-gf_end_hotkey_activation(void)
+gf_stop_release_poll(void)
 {
     if (gf_release_poll) {
         dispatch_source_cancel(gf_release_poll);
         gf_release_poll = nil;
     }
-    gf_unregister_hotkey(&gf_cancel_ref);
 }
 
 /*
- * gf_begin_hotkey_activation — watch a hotkey-started activation for the
- * modifier release and Escape, which the event tap can't see while Secure
- * Event Input is on. Repeat presses during the activation keep the existing
- * watch.
+ * gf_on_modifier_released — commit the activation when the hotkey modifier
+ * is released.
+ *
+ * A release that lands before the panel has opened (gActive still 0) and
+ * inside the press's quick-switch delay is a quick switch: gf_showPanel skips
+ * the grid and gfOnCommit activates the window without showing it.
  *
  * Inputs:  none
  * Output:  none
  */
 static void
-gf_begin_hotkey_activation(void)
+gf_on_modifier_released(void)
 {
+    uint64_t pressed = atomic_load(&gHotkeyPressNs);
+    uint64_t window  = (uint64_t)atomic_load(&gQuickSwitchDelayMs) * NSEC_PER_MSEC;
+    if (!atomic_load(&gActive) && pressed && gf_nowNs() - pressed <= window) {
+        atomic_store(&gQuickSwitch, 1);
+    }
+    gfOnCommit();
+}
+
+/*
+ * gf_on_switch_hotkey — start or advance an activation from a switch hotkey,
+ * and watch for the modifier release that commits it. Main thread.
+ *
+ * Opens a fresh quick-switch window before handing the press to the
+ * switcher. Repeat presses during an activation keep the running poll.
+ *
+ * Inputs:
+ *   shift — nonzero reverses the cycle direction
+ *   scope — 0 = all apps (Tab), 1 = frontmost app only (`)
+ *
+ * Output:
+ *   none
+ */
+static void
+gf_on_switch_hotkey(int shift, int scope)
+{
+    atomic_store(&gQuickSwitch, 0);
+    atomic_store(&gHotkeyPressNs, gf_nowNs());
+    gfOnHotkey(shift, scope);
     if (gf_release_poll) {
         return;
     }
-    const gf_modifier_t *modifier = gf_hotkey_modifier();
-    gf_cancel_ref = gf_register_hotkey(gf_hotkey_cancel, kVK_Escape, modifier->carbon);
 
-    CGEventFlags flag = modifier->flag;
+    CGEventFlags flag = gf_hotkey_modifier()->flag;
     gf_release_poll = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                              dispatch_get_main_queue());
     dispatch_source_set_timer(gf_release_poll, DISPATCH_TIME_NOW,
@@ -611,22 +574,20 @@ gf_begin_hotkey_activation(void)
         if (CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & flag) {
             return;
         }
-        gf_end_hotkey_activation();
-        gf_modifier_released();
+        gf_stop_release_poll();
+        gf_on_modifier_released();
     });
     dispatch_resume(gf_release_poll);
 }
 
 /*
- * gf_on_hotkey — Carbon handler for every go_fish hotkey. Runs on the main
- * thread.
+ * gf_on_hotkey — Carbon handler for every go_fish hotkey. Main thread.
  *
  * Inputs:
  *   event — the kEventHotKeyPressed event; call and info are unused
  *
  * Output:
- *   noErr when the hotkey is ours (acted on only under Secure Event Input),
- *   eventNotHandledErr otherwise.
+ *   noErr when the hotkey is ours, eventNotHandledErr otherwise.
  */
 static OSStatus
 gf_on_hotkey(EventHandlerCallRef call, EventRef event, void *info)
@@ -637,20 +598,13 @@ gf_on_hotkey(EventHandlerCallRef call, EventRef event, void *info)
         hotkey_id.signature != gf_hotkey_signature) {
         return eventNotHandledErr;
     }
-    // The tap has already handled this press; acting on it again would count
-    // it twice, opening the grid two entries along and breaking quick switch.
-    if (!IsSecureEventInputEnabled()) {
-        return noErr;
-    }
-    if (hotkey_id.id == gf_hotkey_cancel) {
-        gf_end_hotkey_activation();
+    if (hotkey_id.id == gf_hotkey_escape || hotkey_id.id == gf_hotkey_modifier_escape) {
         gfOnCancel();
         return noErr;
     }
-    for (size_t i = 0; i < GF_SWITCH_HOTKEY_COUNT; i++) {
+    for (size_t i = 0; i < GF_COUNT(gf_switch_hotkeys); i++) {
         if (gf_switch_hotkeys[i].id == hotkey_id.id) {
-            gf_hotkey_pressed(gf_switch_hotkeys[i].shift, gf_switch_hotkeys[i].scope);
-            gf_begin_hotkey_activation();
+            gf_on_switch_hotkey(gf_switch_hotkeys[i].shift, gf_switch_hotkeys[i].scope);
             return noErr;
         }
     }
@@ -659,9 +613,9 @@ gf_on_hotkey(EventHandlerCallRef call, EventRef event, void *info)
 
 /*
  * gf_register_switch_hotkeys — (re)register the switch hotkeys for the
- * current hotkey modifier, and take Cmd+Tab from the Dock only if go_fish
- * now owns both Cmd+Tab hotkeys. Called at launch and whenever the hotkey
- * modifier setting changes.
+ * current hotkey modifier. With Cmd, take the system shortcuts only if every
+ * switch hotkey registered, so a refused hotkey leaves the system's in place.
+ * Called at launch and whenever the hotkey modifier setting changes.
  *
  * Inputs:  none (reads gHotkeyModifier)
  * Output:  none
@@ -669,29 +623,25 @@ gf_on_hotkey(EventHandlerCallRef call, EventRef event, void *info)
 static void
 gf_register_switch_hotkeys(void)
 {
-    gf_end_hotkey_activation();
-    for (size_t i = 0; i < GF_SWITCH_HOTKEY_COUNT; i++) {
-        gf_unregister_hotkey(&gf_switch_refs[i]);
-    }
-
+    gf_stop_release_poll();
     const gf_modifier_t *modifier = gf_hotkey_modifier();
-    for (size_t i = 0; i < GF_SWITCH_HOTKEY_COUNT; i++) {
+    bool all_registered = true;
+    for (size_t i = 0; i < GF_COUNT(gf_switch_hotkeys); i++) {
         const gf_switch_hotkey_t *h = &gf_switch_hotkeys[i];
+        gf_unregister_hotkey(&gf_switch_refs[i]);
         gf_switch_refs[i] = gf_register_hotkey(
             h->id, h->key_code, modifier->carbon | (h->shift ? shiftKey : 0));
+        all_registered = all_registered && gf_switch_refs[i];
     }
-
-    bool owns_cmd_tab = modifier == &gf_hotkey_modifiers[0] &&
-                        gf_switch_refs[0] && gf_switch_refs[1];
-    gf_set_system_switcher(!owns_cmd_tab);
+    gf_take_system_shortcuts(modifier == &gf_hotkey_modifiers[0] && all_registered);
 }
 
 /*
  * gf_install_hotkeys — install the Carbon hotkey handler, register the
- * switch hotkeys, and make sure Cmd+Tab goes back to the Dock when go_fish
- * exits: on a normal quit (atexit) and on SIGTERM, SIGINT or SIGHUP, which
- * are turned into a normal exit. A crash or SIGKILL leaves the Dock's
- * Cmd+Tab off until go_fish runs again.
+ * switch hotkeys, and put the system shortcuts back when go_fish exits: on a
+ * normal quit (atexit) and on SIGTERM, SIGINT or SIGHUP, which are turned
+ * into a normal exit. After a crash or SIGKILL they stay off until go_fish
+ * runs and exits again.
  *
  * Inputs:  none
  * Output:  none
@@ -699,21 +649,21 @@ gf_register_switch_hotkeys(void)
 static void
 gf_install_hotkeys(void)
 {
-    static dispatch_source_t exit_signals[3];
-    static const int signals[3] = { SIGTERM, SIGINT, SIGHUP };
+    static const int exit_signals[] = { SIGTERM, SIGINT, SIGHUP };
+    static dispatch_source_t exit_sources[GF_COUNT(exit_signals)];
 
     EventTypeSpec pressed = { kEventClassKeyboard, kEventHotKeyPressed };
     InstallApplicationEventHandler(gf_on_hotkey, 1, &pressed, NULL, NULL);
     gf_register_switch_hotkeys();
 
-    atexit(gf_restore_system_switcher);
-    for (int i = 0; i < 3; i++) {
-        signal(signals[i], SIG_IGN);
-        exit_signals[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,
-                                                 (uintptr_t)signals[i], 0,
+    atexit(gf_restore_system_shortcuts);
+    for (size_t i = 0; i < GF_COUNT(exit_signals); i++) {
+        signal(exit_signals[i], SIG_IGN);
+        exit_sources[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,
+                                                 (uintptr_t)exit_signals[i], 0,
                                                  dispatch_get_main_queue());
-        dispatch_source_set_event_handler(exit_signals[i], ^{ exit(0); });
-        dispatch_resume(exit_signals[i]);
+        dispatch_source_set_event_handler(exit_sources[i], ^{ exit(0); });
+        dispatch_resume(exit_sources[i]);
     }
 }
 
@@ -1871,17 +1821,17 @@ static void gf_scheduleThumbPurge(void) {
 
 // Minimum wait before ordering the panel front, even when the quick-switch
 // window has already fully elapsed. The panel must never be shown in the same
-// run-loop turn as a modifier-up still sitting in the HID tap's Mach port: the
-// main queue would win that race and the grid would flash on a tap-and-release.
+// run-loop turn as a modifier-up the release poll hasn't sampled yet (it samples
+// every 10 ms): the grid would flash on a tap-and-release.
 // A drain floor, not a user preference — hence separate from gQuickSwitchDelayMs.
 static const int kShowDrainFloorMs = 16;
 
 /*
  * gf_showDelayMs — remaining quick-switch wait owed before drawing the grid.
  *
- * The quick-switch window is defined from the hotkey *press*: the tap callback
- * stamps gHotkeyPressNs, and the modifier-up test in tapCallback measures the
- * release against that same instant. Window enumeration runs between the press
+ * The quick-switch window is defined from the hotkey *press*:
+ * gf_on_switch_hotkey stamps gHotkeyPressNs, and gf_on_modifier_released
+ * measures the release against that same instant. Window enumeration runs between the press
  * and this call, so waiting the full delay here would stack it on top of time
  * the window has already absorbed. Charge the elapsed time against the budget
  * instead, so the grid appears one delay after the press rather than one delay
@@ -1905,13 +1855,11 @@ static int gf_showDelayMs(void) {
 void gf_showPanel(void *data, int selected) {
     gf_pd_t *d = (gf_pd_t *)data;
     uint64_t token = atomic_fetch_add(&gShowToken, 1) + 1;
-    // Delay before showing the panel so the run loop has time to drain any
-    // pending HID events (modifier-up) before we commit to drawing the grid.
-    // This is the "quick-switch window": if the user releases the hotkey
-    // modifier within this period, gQuickSwitch is set to 1 and the block
-    // below bails out instead of showing the panel. Without the delay the
-    // dispatch queue can win the run loop race against the HID tap Mach port,
-    // causing the panel to flash briefly even on a quick tap.
+    // Delay before showing the panel so the release poll has time to see a
+    // modifier-up before we commit to drawing the grid. This is the
+    // "quick-switch window": if the user releases the hotkey modifier within
+    // this period, gQuickSwitch is set to 1 and the block below bails out
+    // instead of showing the panel, so a quick tap never flashes the grid.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                 (int64_t)gf_showDelayMs() * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
@@ -1981,6 +1929,7 @@ void gf_showPanel(void *data, int selected) {
             [gPanelView setNeedsDisplay:YES];
             [gPanel orderFrontRegardless];
             atomic_store(&gActive, 1);
+            gf_set_escape_hotkeys(true);
 
             gf_fireCaptureRefresh(items);
             freePanelData(d);
@@ -2027,6 +1976,7 @@ void gf_hidePanel(void) {
             [gPanelView setNeedsDisplay:YES];
         }
         if (gPanel) [gPanel orderOut:nil];
+        gf_set_escape_hotkeys(false);
         // Reclaim the thumbnail cache once the panel has stayed closed a while.
         gf_scheduleThumbPurge();
     };
@@ -3886,7 +3836,7 @@ static void gf_applySEIState(BOOL active) {
     if (!gStatusItem) return;
     if (active) {
         gStatusItem.button.image   = gIconSEI ?: gIconNormal;
-        gStatusItem.button.toolTip = @"Secure Event Input is active — go_fish is using its fallback hotkeys";
+        gStatusItem.button.toolTip = @"Secure Event Input is active (go_fish shortcuts still work)";
     } else {
         gStatusItem.button.image   = gIconNormal;
         gStatusItem.button.toolTip = @"go_fish";
@@ -3959,7 +3909,7 @@ static void gf_stopSEITimer(void) {
         ? NSControlStateValueOn : NSControlStateValueOff;
     self.seiCheck.state = atomic_load(&gSEIDetection)
         ? NSControlStateValueOn : NSControlStateValueOff;
-    [self.hotkeyPopup selectItemAtIndex:atomic_load(&gHotkeyModifier)];
+    [self.hotkeyPopup selectItemAtIndex:gf_hotkey_modifier_index()];
     int cd = atomic_load(&gQuickSwitchDelayMs);
     [self.delayPopup selectItemAtIndex:(cd == 75) ? 0 : (cd == 150) ? 2 : 1];
 
@@ -4077,7 +4027,7 @@ static void gf_stopSEITimer(void) {
     self.focusCheck = addCheck(@"Show cascade button in grid",
                                focusY, @selector(toggleFocusButton:));
     self.hotkeyPopup = addPopupRow(@"Hotkey:",
-        @[@"Cmd+Tab (default)", @"Ctrl+Tab", @"Option+Tab"],
+        @[@"Cmd+Tab (default)", @"Ctrl+Tab"],
         hotkeyY, @selector(changeHotkey:));
     self.delayPopup = addPopupRow(@"Quick switch delay:",
         @[@"75 ms", @"100 ms (default)", @"150 ms"],
@@ -4463,7 +4413,6 @@ void gf_run(const void *iconBytes, int iconLen) {
             [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
             gf_setupMRUTracking();
             installStatusItem(iconBytes, iconLen);
-            installEventTap();
             gf_install_hotkeys();
         }
         [NSApp run];

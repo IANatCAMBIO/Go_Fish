@@ -30,10 +30,10 @@ the same app.
   turn into a per-login prompt loop
 - **Works under Secure Event Input** — when an app holds Secure Event
   Input (Terminal during `sudo`, password managers, some VPN clients),
-  keystrokes are invisible to *any* third-party event tap. go_fish also
-  registers its shortcuts as system hotkeys, which still fire, so Cmd+Tab
-  keeps opening the grid instead of falling through to the Dock's
-  switcher. A red X on the menu-bar icon shows when this is happening.
+  keystrokes are invisible to *any* third-party event tap. go_fish
+  registers its shortcuts as system hotkeys instead, which still fire, so
+  Cmd+Tab keeps opening the grid. A red X on the menu-bar icon shows when
+  Secure Event Input is on.
 - **Thumbnail caching** so the grid opens instantly for recently-focused
   windows
 - **Auto-sized panel** that adapts to the number of open windows
@@ -74,12 +74,9 @@ Privacy & Security**:
 1. **Accessibility** → enable `go_fish`
 2. **Screen Recording** → enable `go_fish`
 
-Then re-launch. Also under **System Settings → Keyboard → Keyboard
-Shortcuts**:
-
-3. **Mission Control** → uncheck Cmd+Tab
-4. **Keyboard** → uncheck "Move focus to next window in active app"
-   (Cmd+\`)
+Then re-launch. There are no system shortcuts to turn off: while go_fish
+runs it switches off the system Cmd+Tab and Cmd+\` itself, and puts your
+settings back when it quits.
 
 Press Cmd+Tab. The grid pops up. Cycle with Tab, release Cmd to commit,
 Esc to cancel. If you want go_fish back automatically next login, click
@@ -109,18 +106,18 @@ go_fish/
 
 Written in Objective-C against AppKit, Accessibility, and CoreGraphics:
 
-- **Hotkey capture** — a global `CGEventTap` intercepts Cmd+Tab and
-  Cmd+\` before they reach the focused app. macOS Secure Event Input
-  bypasses *all* third-party taps, so the same shortcuts are also
-  registered with Carbon's `RegisterEventHotKey`, which the WindowServer
-  matches itself. Outside Secure Event Input the hotkey handler ignores
-  them, since the tap has already handled the same press. While a hotkey-started activation is
-  open, go_fish polls the modifier state for the release and registers
-  modifier+Escape for cancel. With the Cmd modifier, the system Cmd+Tab
-  (which would otherwise win) is switched off via the private
-  `CGSSetSymbolicHotKeyEnabled` while go_fish runs and restored when it
-  quits. A poller against `IsSecureEventInputEnabled()` paints a red-X
-  overlay on the menu-bar icon while Secure Event Input is on.
+- **Hotkey capture** — Cmd+Tab, Cmd+Shift+Tab, Cmd+\` and Cmd+Shift+\`
+  are Carbon `RegisterEventHotKey` hotkeys. The WindowServer matches them
+  itself, so unlike an event tap they keep working under Secure Event
+  Input. While a hotkey-started activation is open, go_fish polls the
+  modifier state every 10 ms for the release that commits it, and while
+  the grid is up it registers Escape and Cmd+Escape to cancel. With the
+  Cmd modifier, the system Cmd+Tab, Cmd+Shift+Tab and Cmd+\` (which would
+  otherwise win) are switched off via the private
+  `CGSSetSymbolicHotKeyEnabled` while go_fish runs; on quit go_fish puts
+  back whatever is saved in System Settings. A poller against
+  `IsSecureEventInputEnabled()` paints a red-X overlay on the menu-bar
+  icon while Secure Event Input is on.
 - **Window enumeration** — `kAXWindowsAttribute` per running app,
   snapshotted on demand (no background polling) and parallelized across
   apps via `dispatch_apply` so latency scales with the slowest app, not

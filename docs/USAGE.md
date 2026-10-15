@@ -21,7 +21,7 @@ On the first launch, go_fish needs two permissions and will exit with a
 message after each. Grant them in **System Settings → Privacy & Security**:
 
 1. **Accessibility** — required to read each app's window list, raise
-   windows, un-minimize them, and intercept Cmd+Tab via a global event tap.
+   windows, and un-minimize them.
 2. **Screen Recording** — required to capture live thumbnails of windows.
    Without it, every tile falls back to the app icon (the program still
    works, just less informative).
@@ -39,8 +39,6 @@ After granting both, re-launch. You should see:
 
 ```
 go_fish running. Press Cmd+Tab to switch windows, or click the hook in the menu bar.
-If the system switcher opens instead of go_fish, disable Cmd+Tab in
-System Settings > Keyboard > Keyboard Shortcuts > Mission Control.
 ```
 
 A fishing-hook icon appears in the right side of the menu bar while
@@ -69,34 +67,24 @@ go_fish is running. Click it to drop down a menu:
 - **Secure Event Input detection** (toggle) — when checked (default),
   go_fish polls `IsSecureEventInputEnabled()` every 0.5 s. While Secure
   Event Input is held by another app, the menu-bar icon gets a red X
-  overlay and the tooltip changes to "Secure Event Input is active —
-  go_fish is using its fallback hotkeys". macOS routes keyboard events
-  past every third-party event tap in that state, so go_fish runs on the
-  system hotkeys it registers at launch. See **Troubleshooting → Cmd+Tab
-  silently does nothing** below.
+  overlay and the tooltip changes to "Secure Event Input is active
+  (go_fish shortcuts still work)". go_fish itself is unaffected; the
+  indicator shows when other tools that rely on event taps go blind.
 - **Quit** — terminates go_fish. The keyboard shortcut listed beside it
   (⌘Q) only works while the menu is open; there's no key window
   otherwise.
 
-## Disable the conflicting system shortcuts
+## The system's own Cmd+Tab and Cmd+\`
 
-macOS has two built-in shortcuts that fire inside WindowServer **before**
-any third-party event tap can see them. Both need to be off for go_fish
-to receive the keystrokes reliably:
+macOS's Cmd+Tab, Cmd+Shift+Tab (the Dock's app switcher) and Cmd+\` ("Move
+focus to next window") would win over go_fish's hotkeys. With the Cmd
+hotkey modifier, go_fish switches all three off while it runs, so there is
+nothing to change in System Settings. When go_fish quits it puts back
+whatever System Settings has saved for each one, so a shortcut you turned
+off there stays off.
 
-1. **Cmd+Tab** (system app switcher) — nothing to do. With the Cmd
-   hotkey modifier, go_fish switches the system Cmd+Tab and Cmd+Shift+Tab
-   off while it runs and back on when it quits, so Cmd+Tab reaches go_fish
-   even under Secure Event Input. If go_fish crashes or is killed with
-   `kill -9`, the system Cmd+Tab stays off until go_fish runs again.
-
-2. **Cmd+\`** (system "Move focus to next window") → **System Settings →
-   Keyboard → Keyboard Shortcuts → Keyboard**, find "Move focus to next
-   window in active app" bound to ⌘\`, and uncheck it.
-
-You can leave either binding enabled if you only want one of the two
-go_fish shortcuts — they're independent. If a shortcut doesn't seem to
-trigger go_fish, the system binding is the first thing to check.
+If go_fish crashes or is killed with `kill -9`, the three stay off until
+go_fish runs and quits again (or you log out).
 
 ## Using the switcher
 
@@ -183,14 +171,12 @@ in-app Cmd+\`, etc.) also register.
 
 ## Configuration
 
-For now go_fish has no config file — the hotkey is fixed at **Cmd+Tab** by
-design (it's the slot you've chosen to replace). Future configuration
-points, if you want them:
+The hotkey modifier (Cmd or Ctrl) is in **Settings…**. Other configuration
+points live in the source:
 
 | Setting              | Where to change in source                  | Default                  |
 | -------------------- | ------------------------------------------ | ------------------------ |
-| Trigger keycode      | `cocoa.m` → `tapCallback` `0x30`           | Tab                      |
-| Trigger modifier     | `cocoa.m` → `kCGEventFlagMaskCommand`      | Cmd                      |
+| Trigger keys         | `cocoa.m` → `gf_switch_hotkeys`            | Tab, \`                  |
 | Tile size            | `cocoa.m` → `gf_preferredPanelSize` `tileW`| 240pt wide tiles         |
 | Panel clamp          | `cocoa.m` → `gf_showPanel` `maxW`/`maxH`   | 90% × 85% of screen      |
 | Per-app AX timeout   | `cocoa.m` → `kAXAppTimeout`                | 0.1 s                    |
@@ -269,7 +255,7 @@ osascript -e 'tell application "System Events" to delete (every login item whose
 ## Resource footprint
 
 - Idle: a few tens of MB resident, ~0% CPU. The only ongoing background
-  work is an event tap waiting for keystrokes via `CFRunLoop`, plus
+  work is registered hotkeys waiting on the run loop, plus
   occasional thumbnail re-captures triggered by focus/activation events
   (a single `CGWindowListCreateImage` per event, ~10–30 ms each).
 - Per activation: one round of AX enumeration plus, if the cache is hit,
@@ -305,29 +291,16 @@ Disable it (see "Disable the system Cmd+Tab" above).
 
 ### Cmd+Tab silently does nothing (system switcher also doesn't appear)
 
-Usually **Secure Event Input** is active and go_fish's fallback
-hotkeys didn't register. macOS routes keyboard events past every
-third-party event tap when an app has asserted secure input — Terminal
-during `sudo`/`ssh`, password managers while filling, some VPN clients
-during auth, Citrix / Microsoft Remote Desktop, and Zoom remote-control
-sessions are the common offenders. go_fish covers this with system
-hotkeys; run the bundle's executable from a terminal and look for
-`could not register hotkey`. macOS 15 and later refuse hotkeys whose only
-modifier is Option, so the Option+Tab setting has no fallback.
-
-If the **Secure Event Input detection** menu item is checked (default),
-the menu-bar icon shows a red X overlay during these periods and the
-tooltip says so explicitly. Verify which process is holding it:
+Most likely a hotkey failed to register. Another app may already own
+the same shortcut. Run the bundle's executable from a terminal and look
+for `could not register hotkey`:
 
 ```sh
-ioreg -l -w 0 | grep -i "kCGSSessionSecureInputPID"
-# then map the PID to a process:
-ps -p <pid>
+pkill -x go_fish; ~/Applications/go_fish.app/Contents/MacOS/go_fish
 ```
 
-Otherwise, move focus off the secure-input source (click a different
-window) or quit the holding app to clear it. Terminal in particular is known to occasionally
-leak secure input after `sudo`; relaunching Terminal clears it.
+When the Cmd hotkeys don't all register, go_fish leaves the system's
+Cmd+Tab switched on, so the Dock's switcher appears instead.
 
 ### Thumbnails are missing / all entries show app icons
 
