@@ -32,8 +32,7 @@ the same app.
   Input (Terminal during `sudo`, password managers, some VPN clients),
   keystrokes are invisible to *any* third-party event tap. go_fish
   registers its shortcuts as system hotkeys instead, which still fire, so
-  Cmd+Tab keeps opening the grid. A red X on the menu-bar icon shows when
-  Secure Event Input is on.
+  Cmd+Tab keeps opening the grid.
 - **Thumbnail caching** so the grid opens instantly for recently-focused
   windows
 - **Auto-sized panel** that adapts to the number of open windows
@@ -97,7 +96,7 @@ go_fish/
 ## Documentation
 
 - [docs/USAGE.md](docs/USAGE.md) — full keyboard/mouse reference, menu
-  items, auto-launch / "Start at boot", Secure Event Input behavior,
+  items, auto-launch / "Start at boot", system shortcuts,
   configuration, troubleshooting
 - [docs/BUILDING.md](docs/BUILDING.md) — build requirements, code
   signing, cross-compilation
@@ -115,9 +114,7 @@ Written in Objective-C against AppKit, Accessibility, and CoreGraphics:
   Cmd modifier, the system Cmd+Tab, Cmd+Shift+Tab and Cmd+\` (which would
   otherwise win) are switched off via the private
   `CGSSetSymbolicHotKeyEnabled` while go_fish runs; on quit go_fish puts
-  back whatever is saved in System Settings. A poller against
-  `IsSecureEventInputEnabled()` paints a red-X overlay on the menu-bar
-  icon while Secure Event Input is on.
+  back whatever is saved in System Settings.
 - **Window enumeration** — `kAXWindowsAttribute` per running app,
   snapshotted on demand (no background polling) and parallelized across
   apps via `dispatch_apply` so latency scales with the slowest app, not

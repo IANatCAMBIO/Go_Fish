@@ -69,8 +69,7 @@ using `open`:
 The `FWORKS` variable in the `Makefile` lists these system frameworks:
 
 - `Cocoa` — NSApplication, NSPanel, NSImage
-- `Carbon` — `RegisterEventHotKey` (the switch shortcuts) and
-  `IsSecureEventInputEnabled`
+- `Carbon` — `RegisterEventHotKey` (the switch shortcuts)
 - `ApplicationServices` — Accessibility (AX) API
 - `CoreGraphics` — modifier state, window listing, screen capture
 - `CoreServices` — `LSSharedFileList` (the **Start at boot** Login Items entry)
@@ -239,11 +238,10 @@ go_fish/
     │                      #   Minimize All / Cascade All / About… /
     │                      #   Settings… / Quit), About window,
     │                      #   settings window (hotkey, quick-switch delay,
-    │                      #   Start at boot, SEI detection, grid toggles,
+    │                      #   Start at boot, grid toggles,
     │                      #   title overrides), MRU,
     │                      #   thumbnail cache, activation, close, bulk minimize /
-    │                      #   cascade, Login Items install/uninstall,
-    │                      #   Secure Event Input poller + red-X icon overlay
+    │                      #   cascade, Login Items install/uninstall
     ├── hook.png           # menu-bar icon, embedded via xxd-generated hook_png.h
     └── maui.png           # About-window image, embedded via maui_png.h
 ```

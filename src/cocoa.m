@@ -23,14 +23,10 @@
 //     the running binary from the per-user Login Items list (System Settings
 //     > General > Login Items) via the LSSharedFileList session list.
 //     Effective on next login; we don't relaunch the current instance.
-//   - Secure Event Input poller (0.5 s NSTimer) backing the SEI menu toggle.
-//     When another app holds Secure Event Input we paint a red-X overlay on
-//     the menu-bar icon and say so in the tooltip. go_fish's hotkeys keep
-//     working; the indicator is there to show which app is hiding keystrokes.
 
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
-#import <Carbon/Carbon.h>              // RegisterEventHotKey, IsSecureEventInputEnabled
+#import <Carbon/Carbon.h>              // RegisterEventHotKey
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreServices/CoreServices.h>  // LSSharedFileList (Login Items)
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -165,11 +161,6 @@ static GFPanelView *gPanelView = nil;
 @class GFStatusHandler;
 static NSStatusItem    *gStatusItem    = nil;
 static GFStatusHandler *gStatusHandler = nil;
-static NSImage         *gIconNormal    = nil;  // template silhouette
-static NSImage         *gIconSEI       = nil;  // composite with red X
-static NSTimer         *gSEITimer      = nil;
-static atomic_int       gSEIDetection  = 1;    // user preference
-static atomic_int       gSEIActive     = 0;    // last observed state
 static atomic_int       gShowWindowlessApps = 0; // user preference: surface
                                                  // running regular apps that
                                                  // have no windows as tiles.
@@ -197,7 +188,6 @@ static NSMutableDictionary<NSString *, NSImage *> *gOverrideIconCache = nil;
 @property (nonatomic, strong) NSButton      *focusCheck;
 @property (nonatomic, strong) NSPopUpButton *hotkeyPopup;
 @property (nonatomic, strong) NSPopUpButton *delayPopup;
-@property (nonatomic, strong) NSButton      *seiCheck;
 // Override-rules UI
 @property (nonatomic, strong) NSButton      *overrideEnableCheck;
 @property (nonatomic, strong) NSScrollView  *overrideScrollView;
@@ -3242,10 +3232,6 @@ static void gf_uninstallObserverForPID(pid_t pid) {
 - (void)appTerminated:(NSNotification *)note;
 @end
 
-// Forward decl so appActivated: can request an immediate SEI re-check.
-// Defined down with the rest of the SEI poller machinery.
-static void gf_pollSEI(void);
-
 @implementation GFMRUTracker
 
 - (void)appActivated:(NSNotification *)note {
@@ -3276,13 +3262,6 @@ static void gf_pollSEI(void);
         gf_retryActivationPush(pid, 0);
     }
     gf_installObserverForPID(pid, 0); // in case it's a freshly-regular app
-
-    // App activation is the dominant trigger for Secure Event Input
-    // state changes — most SEI-holding apps assert it as part of
-    // becoming active (or release it on resign). Re-poll immediately
-    // so the red-X overlay flips inside one runloop tick instead of
-    // waiting up to the next gSEITimer fire.
-    gf_pollSEI();
 }
 
 - (void)appLaunched:(NSNotification *)note {
@@ -3547,9 +3526,6 @@ static GFAboutWindowController *gAboutController = nil;
 - (void)quit:(id)sender;
 @end
 
-static void gf_startSEITimer(void);
-static void gf_stopSEITimer(void);
-static void gf_applySEIState(BOOL active);
 
 @implementation GFStatusHandler
 - (void)showGrid:(id)sender {
@@ -3797,82 +3773,6 @@ static NSImage *gf_makeMenuIcon(const void *bytes, int len) {
     return icon;
 }
 
-// Build a "go_fish unavailable" composite: the silhouette in the current
-// appearance's label color, with a bright red X stroked on top. Non-template
-// so the red stays red regardless of menu-bar appearance.
-static NSImage *gf_makeSEIIcon(NSImage *base) {
-    if (!base) return nil;
-    NSSize sz = base.size;
-    NSImage *out = [NSImage imageWithSize:sz flipped:NO drawingHandler:^BOOL(NSRect _r) {
-        NSRect r = NSMakeRect(0, 0, sz.width, sz.height);
-        // Draw the silhouette, then tint it to labelColor via sourceAtop so
-        // the icon stays legible in both light and dark menu bars.
-        [base drawInRect:r];
-        [[NSColor labelColor] set];
-        NSRectFillUsingOperation(r, NSCompositingOperationSourceAtop);
-
-        // Red X overlay.
-        CGFloat pad = sz.width * 0.18;
-        CGFloat lw  = MAX(2.0, sz.width * 0.18);
-        NSBezierPath *p = [NSBezierPath bezierPath];
-        [p moveToPoint:NSMakePoint(pad, pad)];
-        [p lineToPoint:NSMakePoint(sz.width - pad, sz.height - pad)];
-        [p moveToPoint:NSMakePoint(sz.width - pad, pad)];
-        [p lineToPoint:NSMakePoint(pad, sz.height - pad)];
-        p.lineWidth    = lw;
-        p.lineCapStyle = NSLineCapStyleRound;
-        [[NSColor systemRedColor] setStroke];
-        [p stroke];
-        return YES;
-    }];
-    out.template = NO;
-    return out;
-}
-
-// Swap the status-item icon + tooltip to reflect whether Secure Event Input
-// is currently blocking go_fish.
-static void gf_applySEIState(BOOL active) {
-    atomic_store(&gSEIActive, active ? 1 : 0);
-    if (!gStatusItem) return;
-    if (active) {
-        gStatusItem.button.image   = gIconSEI ?: gIconNormal;
-        gStatusItem.button.toolTip = @"Secure Event Input is active (go_fish shortcuts still work)";
-    } else {
-        gStatusItem.button.image   = gIconNormal;
-        gStatusItem.button.toolTip = @"go_fish";
-    }
-}
-
-static void gf_pollSEI(void) {
-    if (!atomic_load(&gSEIDetection)) return;
-    BOOL nowActive = IsSecureEventInputEnabled() ? YES : NO;
-    BOOL wasActive = atomic_load(&gSEIActive) ? YES : NO;
-    if (nowActive != wasActive) gf_applySEIState(nowActive);
-}
-
-static void gf_startSEITimer(void) {
-    if (gSEITimer) return;
-    // 500 ms covers the in-app cases that don't fire an activation event
-    // (Terminal entering `sudo`, password field gaining focus). App-
-    // activation triggers get near-instant feedback via the explicit
-    // re-poll in GFMRUTracker.appActivated:. IsSecureEventInputEnabled
-    // is a sub-millisecond syscall, so 2 Hz polling is free.
-    // NSRunLoopCommonModes covers NSDefaultRunLoopMode + NSEventTrackingRunLoopMode
-    // so the X appears/disappears while the user has the menu open.
-    gSEITimer = [NSTimer timerWithTimeInterval:0.5
-                                       repeats:YES
-                                         block:^(NSTimer *_t) { gf_pollSEI(); }];
-    [[NSRunLoop currentRunLoop] addTimer:gSEITimer forMode:NSRunLoopCommonModes];
-    // Fire once immediately so initial state is accurate.
-    gf_pollSEI();
-}
-
-static void gf_stopSEITimer(void) {
-    if (!gSEITimer) return;
-    [gSEITimer invalidate];
-    gSEITimer = nil;
-}
-
 // =========================================================================
 // Settings window
 // =========================================================================
@@ -3907,8 +3807,6 @@ static void gf_stopSEITimer(void) {
         ? NSControlStateValueOn : NSControlStateValueOff;
     self.focusCheck.state = atomic_load(&gShowFocusButton)
         ? NSControlStateValueOn : NSControlStateValueOff;
-    self.seiCheck.state = atomic_load(&gSEIDetection)
-        ? NSControlStateValueOn : NSControlStateValueOff;
     [self.hotkeyPopup selectItemAtIndex:gf_hotkey_modifier_index()];
     int cd = atomic_load(&gQuickSwitchDelayMs);
     [self.delayPopup selectItemAtIndex:(cd == 75) ? 0 : (cd == 150) ? 2 : 1];
@@ -3939,10 +3837,6 @@ static void gf_stopSEITimer(void) {
     const CGFloat popupW = W - popupX - margin;
 
     CGFloat y = margin;
-
-    CGFloat seiY        = y; y += 22 + 8;
-    CGFloat diagLabelY  = y; y += 16 + 10;
-    CGFloat sep3Y       = y; y += 1  + 12;
 
     CGFloat btnRowY     = y; y += 24 + 4;
     CGFloat tableY      = y; y += 140 + 6;
@@ -4110,13 +4004,6 @@ static void gf_stopSEITimer(void) {
     self.overrideRemoveBtn.target     = self;
     self.overrideRemoveBtn.action     = @selector(removeOverrideRule:);
     [cv addSubview:self.overrideRemoveBtn];
-
-    addSeparator(sep3Y);
-
-    // ---- DIAGNOSTICS ----
-    addSectionLabel(@"DIAGNOSTICS", diagLabelY);
-    self.seiCheck = addCheck(@"Secure Event Input detection",
-                              seiY, @selector(toggleSEI:));
 
     self.settingsWindow = win;
 }
@@ -4294,19 +4181,6 @@ static void gf_stopSEITimer(void) {
     [[NSUserDefaults standardUserDefaults] setInteger:ms forKey:@"QuickSwitchDelayMs"];
 }
 
-- (void)toggleSEI:(NSButton *)sender {
-    int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
-    atomic_store(&gSEIDetection, next);
-    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
-                                            forKey:@"SEIDetection"];
-    if (next) {
-        gf_startSEITimer();
-    } else {
-        gf_stopSEITimer();
-        gf_applySEIState(NO);
-    }
-}
-
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     [sender orderOut:nil];
     return NO;
@@ -4316,8 +4190,6 @@ static void gf_stopSEITimer(void) {
 
 static void installStatusItem(const void *iconBytes, int iconLen) {
     NSImage *icon = gf_makeMenuIcon(iconBytes, iconLen);
-    gIconNormal    = icon;
-    gIconSEI       = gf_makeSEIIcon(icon);
     gStatusHandler = [GFStatusHandler new];
     gStatusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:NSVariableStatusItemLength];
@@ -4326,8 +4198,7 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
 
     // Restore the user's preferences.
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults registerDefaults:@{@"SEIDetection": @YES,
-                                 @"ShowWindowlessApps": @NO,
+    [defaults registerDefaults:@{@"ShowWindowlessApps": @NO,
                                  @"MinimizedLast": @YES,
                                  @"ShowFocusButton": @YES,
                                  @"HotkeyModifier": @0,
@@ -4335,7 +4206,6 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                  @"OverridesEnabled": @NO,
                                  @"OverrideRules": @[],
                                  @"SortByApp": @NO}];
-    atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
     atomic_store(&gOverridesEnabled, [defaults boolForKey:@"OverridesEnabled"] ? 1 : 0);
     gf_reloadOverrideRules();
     atomic_store(&gShowWindowlessApps,
@@ -4393,8 +4263,6 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     quitItem.target = gStatusHandler;
     [menu addItem:quitItem];
     gStatusItem.menu = menu; // clicking the icon now pops this menu
-
-    if (atomic_load(&gSEIDetection)) gf_startSEITimer();
 }
 
 // =========================================================================

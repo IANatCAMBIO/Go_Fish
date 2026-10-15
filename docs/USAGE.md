@@ -64,12 +64,6 @@ go_fish is running. Click it to drop down a menu:
   affected. Because a bundle is registered (not the bare binary), it
   launches at login with **no Terminal window**. See **Auto-launch on
   login** below for the contract details.
-- **Secure Event Input detection** (toggle) — when checked (default),
-  go_fish polls `IsSecureEventInputEnabled()` every 0.5 s. While Secure
-  Event Input is held by another app, the menu-bar icon gets a red X
-  overlay and the tooltip changes to "Secure Event Input is active
-  (go_fish shortcuts still work)". go_fish itself is unaffected; the
-  indicator shows when other tools that rely on event taps go blind.
 - **Quit** — terminates go_fish. The keyboard shortcut listed beside it
   (⌘Q) only works while the menu is open; there's no key window
   otherwise.
