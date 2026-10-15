@@ -67,12 +67,13 @@ go_fish is running. Click it to drop down a menu:
   launches at login with **no Terminal window**. See **Auto-launch on
   login** below for the contract details.
 - **Secure Event Input detection** (toggle) — when checked (default),
-  go_fish polls `IsSecureEventInputEnabled()` every 1.5 s. While Secure
+  go_fish polls `IsSecureEventInputEnabled()` every 0.5 s. While Secure
   Event Input is held by another app, the menu-bar icon gets a red X
-  overlay and the tooltip changes to "go_fish unavailable — Secure
-  Event Input is active". Cmd+Tab really *is* unavailable in that
-  state — macOS routes keyboard events past every third-party event
-  tap. See **Troubleshooting → Cmd+Tab silently does nothing** below.
+  overlay and the tooltip changes to "Secure Event Input is active —
+  go_fish is using its fallback hotkeys". macOS routes keyboard events
+  past every third-party event tap in that state, so go_fish runs on the
+  system hotkeys it registers at launch. See **Troubleshooting → Cmd+Tab
+  silently does nothing** below.
 - **Quit** — terminates go_fish. The keyboard shortcut listed beside it
   (⌘Q) only works while the menu is open; there's no key window
   otherwise.
@@ -83,10 +84,11 @@ macOS has two built-in shortcuts that fire inside WindowServer **before**
 any third-party event tap can see them. Both need to be off for go_fish
 to receive the keystrokes reliably:
 
-1. **Cmd+Tab** (system app switcher) → **System Settings → Keyboard →
-   Keyboard Shortcuts → Mission Control**, find the entry bound to ⌘⇥
-   ("application switcher" / "Move focus to next window" depending on
-   macOS version), and uncheck it or rebind it.
+1. **Cmd+Tab** (system app switcher) — nothing to do. With the Cmd
+   hotkey modifier, go_fish switches the system Cmd+Tab and Cmd+Shift+Tab
+   off while it runs and back on when it quits, so Cmd+Tab reaches go_fish
+   even under Secure Event Input. If go_fish crashes or is killed with
+   `kill -9`, the system Cmd+Tab stays off until go_fish runs again.
 
 2. **Cmd+\`** (system "Move focus to next window") → **System Settings →
    Keyboard → Keyboard Shortcuts → Keyboard**, find "Move focus to next
@@ -303,11 +305,15 @@ Disable it (see "Disable the system Cmd+Tab" above).
 
 ### Cmd+Tab silently does nothing (system switcher also doesn't appear)
 
-Almost certainly **Secure Event Input** is active. macOS routes
-keyboard events past every third-party event tap when an app has
-asserted secure input — Terminal during `sudo`/`ssh`, password managers
-while filling, some VPN clients during auth, Citrix / Microsoft Remote
-Desktop, and Zoom remote-control sessions are the common offenders.
+Usually **Secure Event Input** is active and go_fish's fallback
+hotkeys didn't register. macOS routes keyboard events past every
+third-party event tap when an app has asserted secure input — Terminal
+during `sudo`/`ssh`, password managers while filling, some VPN clients
+during auth, Citrix / Microsoft Remote Desktop, and Zoom remote-control
+sessions are the common offenders. go_fish covers this with system
+hotkeys; run the bundle's executable from a terminal and look for
+`could not register hotkey`. macOS 15 and later refuse hotkeys whose only
+modifier is Option, so the Option+Tab setting has no fallback.
 
 If the **Secure Event Input detection** menu item is checked (default),
 the menu-bar icon shows a red X overlay during these periods and the
@@ -319,10 +325,8 @@ ioreg -l -w 0 | grep -i "kCGSSessionSecureInputPID"
 ps -p <pid>
 ```
 
-There's no programmatic workaround inside go_fish — Apple intentionally
-makes secure input un-bypassable, even for HID-level taps. Move focus
-off the secure-input source (click a different window) or quit the
-holding app to clear it. Terminal in particular is known to occasionally
+Otherwise, move focus off the secure-input source (click a different
+window) or quit the holding app to clear it. Terminal in particular is known to occasionally
 leak secure input after `sudo`; relaunching Terminal clears it.
 
 ### Thumbnails are missing / all entries show app icons

@@ -69,6 +69,8 @@ using `open`:
 The `FWORKS` variable in the `Makefile` lists these system frameworks:
 
 - `Cocoa` — NSApplication, NSPanel, NSImage
+- `Carbon` — `RegisterEventHotKey` (the Secure Event Input fallback
+  hotkeys) and `IsSecureEventInputEnabled`
 - `ApplicationServices` — Accessibility (AX) API
 - `CoreGraphics` — `CGEventTap`, window listing, screen capture
 - `CoreServices` — `LSSharedFileList` (the **Start at boot** Login Items entry)
@@ -79,6 +81,11 @@ runtime via `dlsym(RTLD_DEFAULT, "CGWindowListCreateImage")`. The symbol is
 still shipped in `CoreGraphics.framework`; if Apple eventually removes it,
 thumbnails will fall back to app icons and the program will keep working.
 The long-term migration is to ScreenCaptureKit.
+
+`CGSSetSymbolicHotKeyEnabled`, the private call that switches the system
+Cmd+Tab off while go_fish runs, is resolved the same way. If it ever goes
+missing, the system Cmd+Tab stays on and wins over go_fish's hotkeys under
+Secure Event Input; nothing else changes.
 
 `CFLAGS` passes `-Wno-deprecated-declarations` because both the `dlsym`'d
 capture path and the `LSSharedFileList` login-item calls are formally
@@ -236,6 +243,7 @@ go_fish/
     │                      #   title overrides), MRU,
     │                      #   thumbnail cache, activation, close, bulk minimize /
     │                      #   cascade, Login Items install/uninstall,
+    │                      #   Carbon hotkey fallback for Secure Event Input,
     │                      #   Secure Event Input poller + red-X icon overlay
     ├── hook.png           # menu-bar icon, embedded via xxd-generated hook_png.h
     └── maui.png           # About-window image, embedded via maui_png.h

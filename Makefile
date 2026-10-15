@@ -9,6 +9,7 @@ INSTALL_DIR := $(HOME)/Applications
 SRCS    := src/main.m src/cocoa.m src/switcher.m
 CFLAGS  := -fobjc-arc -Wall -Wno-deprecated-declarations -O2
 FWORKS  := -framework Cocoa \
+           -framework Carbon \
            -framework ApplicationServices \
            -framework CoreGraphics \
            -framework CoreServices

@@ -28,11 +28,12 @@ the same app.
   go_fish to your Login Items (System Settings > General > Login Items),
   with a built-in 3-attempt backoff so a missing permission can never
   turn into a per-login prompt loop
-- **Secure Event Input awareness** — when an app holds Secure Event
+- **Works under Secure Event Input** — when an app holds Secure Event
   Input (Terminal during `sudo`, password managers, some VPN clients),
-  Cmd+Tab is invisible to *any* third-party event tap. go_fish polls
-  for this state and overlays a red X on the menu-bar icon so you know
-  the switcher is temporarily unavailable and why.
+  keystrokes are invisible to *any* third-party event tap. go_fish also
+  registers its shortcuts as system hotkeys, which still fire, so Cmd+Tab
+  keeps opening the grid instead of falling through to the Dock's
+  switcher. A red X on the menu-bar icon shows when this is happening.
 - **Thumbnail caching** so the grid opens instantly for recently-focused
   windows
 - **Auto-sized panel** that adapts to the number of open windows
@@ -110,10 +111,16 @@ Written in Objective-C against AppKit, Accessibility, and CoreGraphics:
 
 - **Hotkey capture** — a global `CGEventTap` intercepts Cmd+Tab and
   Cmd+\` before they reach the focused app. macOS Secure Event Input
-  bypasses *all* third-party taps; a 1.5 s poller against
-  `IsSecureEventInputEnabled()` (resolved via `dlsym`) detects this and
-  paints a red-X overlay on the menu-bar icon so the user knows the
-  switcher is unavailable and why.
+  bypasses *all* third-party taps, so the same shortcuts are also
+  registered with Carbon's `RegisterEventHotKey`, which the WindowServer
+  matches itself. Outside Secure Event Input the hotkey handler ignores
+  them, since the tap has already handled the same press. While a hotkey-started activation is
+  open, go_fish polls the modifier state for the release and registers
+  modifier+Escape for cancel. With the Cmd modifier, the system Cmd+Tab
+  (which would otherwise win) is switched off via the private
+  `CGSSetSymbolicHotKeyEnabled` while go_fish runs and restored when it
+  quits. A poller against `IsSecureEventInputEnabled()` paints a red-X
+  overlay on the menu-bar icon while Secure Event Input is on.
 - **Window enumeration** — `kAXWindowsAttribute` per running app,
   snapshotted on demand (no background polling) and parallelized across
   apps via `dispatch_apply` so latency scales with the slowest app, not
